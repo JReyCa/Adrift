@@ -1,0 +1,259 @@
+#pragma kernel ComputeVertices
+#pragma kernel ComputeTriangles
+
+const static float GOLDEN_RATIO = 1.618033988749;   // The ratio between adjacent terms in the Fibonacci sequence as n -> INF.
+const static float EQUILAT_HEIGHT = 0.866025403784; // The height of an equilateral triangle with a side length of 1.
+const static float IN_RADIUS = 0.755761;            // The distance from the centre of a regular, convex icosahedron to the centre of a face (of sidelength 1).
+
+uint _Resolution;
+float _XStep;
+float _ZStep;
+
+StructuredBuffer<float3> _BasisVectors;
+
+RWStructuredBuffer<float3> _Vertices;
+RWStructuredBuffer<float3> _BorderVertices;
+
+RWStructuredBuffer<int> _Triangles;
+RWStructuredBuffer<int> _BorderTriangles;
+
+// Take a position in the id.x X id,y grid, and return the index in the flattened buffer of vertices
+// that's being assigned to.
+int getVertIndex(uint3 id)
+{
+    return id.x + id.y * (_Resolution + 3) - id.y * (id.y + 1) / 2;
+}
+
+// ******************** VERTICES ********************
+// All things pertaining only to vertex computation go here.
+
+struct Basis
+{
+    float3 tangent;
+    float3 normal;
+    float3 cotangent;
+};
+
+// The basis indices:
+// 0 -> for the current face.
+// 1 -> for the face that shares edge AB.
+// 2 -> for the face that shares edge AC.
+// 3 -> for the face that shares edge BC.
+// 4 -> for the face that shares only A.
+// 5 -> for the face that shares only C.
+// 6 -> for the face that shares only B.
+Basis basisByIndex(int index)
+{
+    int baseIndex = index * 3;
+
+    Basis b;
+    b.tangent = _BasisVectors[baseIndex];
+    b.normal = _BasisVectors[baseIndex + 1];
+    b.cotangent = _BasisVectors[baseIndex + 2];
+
+    return b;
+}
+
+float3 transformPoint(float3 p, Basis basis)
+{
+    return p.x * basis.tangent + p.y * basis.normal + p.z * basis.cotangent;
+}
+
+// Set a vertex to the vertex buffer.
+void setVertex(uint3 id, float3 v)
+{
+    uint vertsPerEdge = _Resolution + 2;
+
+    // Ignore vertices that are out of range.
+    if (id.x < vertsPerEdge - id.y && id.y < vertsPerEdge)
+    {
+        _Vertices[getVertIndex(id)] = v;
+    }
+}
+
+// Set a vertex to the border vertex buffer.
+void setBorderVertex(uint3 id, int index, float3 v)
+{
+    uint vertsPerEdge = _Resolution + 2;
+
+    // Ignore vertices that are out of range.
+    if (id.x < vertsPerEdge - id.y && id.y < vertsPerEdge)
+    {
+        _BorderVertices[index] = v;
+    }
+}
+
+[numthreads(8,8,1)]
+void ComputeVertices(uint3 id : SV_DispatchThreadID)
+{
+    // Get the position of the vertex as if the triangle were lying down flat, centred at origin.
+    float xStart = id.y * _XStep * 0.5;
+    float x = id.x * _XStep + xStart - 0.5;         // Subtract 0.5 to centre the triangle.
+    float z = id.y * _ZStep - EQUILAT_HEIGHT / 3;   // Subtract a third of height (oddly enough) to centre it also.
+    float3 rawPoint = float3(x, IN_RADIUS, z);
+
+    // Transform the point according to the basis.
+    Basis currentBasis = basisByIndex(0);
+    float3 pointOnIco = transformPoint(rawPoint, currentBasis);
+    float3 pointOnSphere = normalize(pointOnIco);
+
+    setVertex(id, pointOnSphere);
+
+    // Compute border vertices.
+    Basis borderBasis1 = basisByIndex(1);
+    Basis borderBasis2 = basisByIndex(2);
+    Basis borderBasis3 = basisByIndex(3);
+    Basis borderBasis4 = basisByIndex(4);
+    Basis borderBasis5 = basisByIndex(5);
+    Basis borderBasis6 = basisByIndex(6);
+
+    uint maxEdgeIndex = _Resolution + 1;
+    uint borderIndexOffset = _Resolution + 2;
+
+    if (id.y == 1)
+    {
+        float3 borderPoint1 = normalize(transformPoint(rawPoint, borderBasis1));
+        float3 borderPoint2 = normalize(transformPoint(rawPoint, borderBasis2));
+        float3 borderPoint3 = normalize(transformPoint(rawPoint, borderBasis3));
+
+        setBorderVertex(id, id.x, borderPoint1);
+        setBorderVertex(id, id.x + borderIndexOffset, borderPoint2);
+        setBorderVertex(id, id.x + borderIndexOffset * 2, borderPoint3);
+    }
+
+    if (id.y == 0)
+    {
+        if (id.x == 1)
+        {
+            float3 borderPoint4 = normalize(transformPoint(rawPoint, borderBasis4));
+            float3 borderPoint5 = normalize(transformPoint(rawPoint, borderBasis5));
+
+            setBorderVertex(id, borderIndexOffset - 1, borderPoint4);
+            setBorderVertex(id, borderIndexOffset * 2 - 1, borderPoint5);
+        }
+        if (id.x == maxEdgeIndex - 1)
+        {
+            float3 borderPoint6 = normalize(transformPoint(rawPoint, borderBasis6));
+            setBorderVertex(id, borderIndexOffset * 3 - 1, borderPoint6);
+        }
+    }
+}
+
+// ******************** TRIANGLES ********************
+// All things relating to triangle (i.e. index) computation go here.
+
+// Set the 3 vertex indices of a triangle to the index buffer.
+void setTriangle(int startIndex, int i0, int i1, int i2)
+{
+    _Triangles[startIndex] = i0;
+    _Triangles[startIndex + 1] = i1;
+    _Triangles[startIndex + 2] = i2;
+}
+
+void setBorderTriangle(int startIndex, int i0, int i1, int i2)
+{
+    _BorderTriangles[startIndex] = i0;
+    _BorderTriangles[startIndex + 1] = i1;
+    _BorderTriangles[startIndex + 2] = i2;
+}
+
+// Convert indices for border vertice to a different, negated format, so we can differentiate them later.
+int negifyIndex(int borderIndex)
+{
+    return -(borderIndex + 1);
+}
+
+[numthreads(8, 8, 1)]
+void ComputeTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint vertsPerEdge = _Resolution + 2;
+    uint vertRowLength = vertsPerEdge - id.y;
+    uint borderIndicesPerEdge = 6 * _Resolution + 9;
+
+    int vertIndex = getVertIndex(id);
+    int triIndex = 6 * id.x + 3 * id.y * (2 * _Resolution - id.y + 2);
+    int bottomBorderIndex = id.x * 6;
+    int rightBorderIndex = borderIndicesPerEdge + id.y * 6;
+    int leftBorderIndex = borderIndicesPerEdge * 2 + id.y * 6;
+
+    if (id.x > 0)
+    {
+        triIndex -= 3;
+        bottomBorderIndex -= 3;
+    }
+
+    if (id.y > 0)
+    {
+        rightBorderIndex -= 3;
+        leftBorderIndex -= 3;
+    }
+
+    // Keep us inside the face.
+    if (id.x < vertRowLength && id.y < vertsPerEdge)
+    {
+        if (id.x < vertRowLength - 1 && id.y < vertsPerEdge - 1)
+        {
+            // Calculate rendered triangles.
+            setTriangle(triIndex, vertIndex, vertIndex + vertRowLength, vertIndex + 1);
+
+            if (id.x > 0)
+            {
+                setTriangle(triIndex + 3, vertIndex, vertIndex + vertRowLength - 1, vertIndex + vertRowLength);
+            }
+
+            // Calculate bottom border triangles.
+            if (id.y == 0)
+            {
+                setBorderTriangle(bottomBorderIndex, vertIndex, vertIndex + 1, negifyIndex(id.x));
+
+                if (id.x > 0)
+                {
+                    setBorderTriangle(bottomBorderIndex + 3, vertIndex, negifyIndex(id.x), negifyIndex(id.x - 1));
+                }
+            }
+        }
+
+        // Calculate bottom-right corner triangles.
+        if (id.x == vertRowLength - 1 && id.y == 0)
+        {
+            setBorderTriangle(bottomBorderIndex, vertIndex, negifyIndex(id.x), negifyIndex(id.x - 1));
+            setBorderTriangle(bottomBorderIndex + 3, vertIndex, negifyIndex(vertsPerEdge), negifyIndex(id.x));
+        }
+
+        // Calculate top-right border triangles.
+        if (id.x == vertRowLength - 1 && id.y < vertsPerEdge - 1)
+        {
+            setBorderTriangle(rightBorderIndex, vertIndex, vertIndex + vertRowLength - 1, negifyIndex(vertsPerEdge + id.y));
+
+            if (id.y > 0)
+            {
+                setBorderTriangle(rightBorderIndex + 3, vertIndex, negifyIndex(vertsPerEdge + id.y), negifyIndex(vertsPerEdge + id.y - 1));
+            }
+        }
+
+        // Calculate top corner triangles.
+        if (id.x == 0 && id.y == vertsPerEdge - 1)
+        {
+            setBorderTriangle(rightBorderIndex, vertIndex, negifyIndex(vertsPerEdge * 2 - 1), negifyIndex(vertsPerEdge * 2 - 2));
+            setBorderTriangle(rightBorderIndex + 3, vertIndex, negifyIndex(vertsPerEdge * 3 - 2), negifyIndex(vertsPerEdge * 2 - 1));
+        }
+
+        // Calculate top-left border triangles.
+        if (id.x == 0 && id.y < vertsPerEdge - 1)
+        {
+            setBorderTriangle(leftBorderIndex, vertIndex, negifyIndex(vertsPerEdge * 2 + id.y), vertIndex + vertRowLength);
+
+            if (id.y > 0)
+            {
+                setBorderTriangle(leftBorderIndex + 3, vertIndex, negifyIndex(vertsPerEdge * 2 + id.y - 1), negifyIndex(vertsPerEdge * 2 + id.y));
+            }
+        }
+
+        // Calculate bottom-left corner triangles.
+        if (id.x == 0 && id.y == 0)
+        {
+            setBorderTriangle(borderIndicesPerEdge * 3 - 6, vertIndex, negifyIndex(vertsPerEdge * 3 - 1), negifyIndex(vertsPerEdge * 2));
+            setBorderTriangle(borderIndicesPerEdge * 3 - 3, vertIndex, -1, negifyIndex(vertsPerEdge * 3 - 1));
+        }
+    }
+}
